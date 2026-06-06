@@ -1,0 +1,8 @@
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+*.log
+runtime_state_v5.json
+runtime_state_v6.json
+.ipynb_checkpoints/

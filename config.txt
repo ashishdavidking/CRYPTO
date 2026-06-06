@@ -1,0 +1,3 @@
+API_KEY        = "2Osa4t9SlClNFROV2ydx0Jmke1P0J0"
+API_SECRET     = "fZyJp5LzrIJEx2Sa47j2ginlBLgKZ9U1rF6M6BJ6VdFeBaL48fmHBjKC4xr7"
+BASE_URL       = "https://api.india.delta.exchange"
