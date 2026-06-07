@@ -39,8 +39,8 @@ def log_err(msg, exc=None):
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-API_KEY        = "2Osa4t9SlClNFROV2ydx0Jmke1P0J0"
-API_SECRET     = "fZyJp5LzrIJEx2Sa47j2ginlBLgKZ9U1rF6M6BJ6VdFeBaL48fmHBjKC4xr7"
+API_KEY        = "ENTERyourapikey"
+API_SECRET     = "enteryour_API_SECRET "
 BASE_URL       = "https://api.india.delta.exchange"
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Set DELTA_API_KEY and DELTA_API_SECRET first.")
