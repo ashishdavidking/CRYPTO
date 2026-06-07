@@ -62,8 +62,8 @@ def log_err(msg, exc=None):
 # API_KEY    = os.getenv("DELTA_API_KEY",    "")
 # API_SECRET = os.getenv("DELTA_API_SECRET", "")
 # BASE_URL   = os.getenv("DELTA_BASE_URL",   "https://api.india.delta.exchange")
-API_KEY        = "2Osa4t9SlClNFROV2ydx0Jmke1P0J0"
-API_SECRET     = "fZyJp5LzrIJEx2Sa47j2ginlBLgKZ9U1rF6M6BJ6VdFeBaL48fmHBjKC4xr7"
+API_KEY        = ""
+API_SECRET     = ""
 BASE_URL       = "https://api.india.delta.exchange"
 if not API_KEY or not API_SECRET:
     raise RuntimeError(
@@ -98,8 +98,19 @@ CONFIRM_BARS       = 3
 DOJI_FACTOR        = 0.1
 MAX_STATE_AGE_BARS = 20         # 20 × 15 min = 5 hours max state lifetime
 
+# Break-Even Stop Loss Settings
+BE_ENABLED            = True
+BE_TRIGGER_R_MULTIPLE = 1.0     # Move SL to entry when profit equals 1.0x of the initial risk
+
 # OI flow filter
-OI_FILTER_ENABLED  = True       # set False to disable institutional filter
+OI_FILTER_ENABLED     = True    # set False to disable institutional filter
+OI_WINDOW_LEAP_TICKS  = 60      # 15 minutes (60 ticks * 15s)
+OI_THRESHOLD_VAL      = 10.0    # Minimum OI contract change threshold over the window
+OI_PRICE_THRESHOLD    = 50.0    # Minimum price change threshold (USD) over the window
+
+# Options Put/Call Ratio (PCR) Filter Boundaries
+OPTION_PCR_BULLISH_THRESHOLD = 0.6  # PCR below this means market is too Bullish (block SHORT trades)
+OPTION_PCR_BEARISH_THRESHOLD = 1.0  # PCR above this means market is too Bearish (block LONG trades)
 
 # Files
 DB_FILE    = "alpha_btcusd_v5.db"
@@ -509,15 +520,20 @@ def calc_lot_size(capital_usd, risk_pct, entry_price, sl_price, leverage):
 # ═══════════════════════════════════════════════════════════════
 #  OI FLOW CLASSIFIER
 # ═══════════════════════════════════════════════════════════════
-def classify_oi_phase(oi_prev: float, oi_curr: float, price_prev: float, price_curr: float) -> str:
-    dOI = oi_curr - oi_prev
-    dP  = price_curr - price_prev
-    threshold_oi    = 2.0
-    threshold_price = 30.0
-    if dOI >  threshold_oi and dP >  threshold_price: return "LONGS ADDING"
-    if dOI >  threshold_oi and dP < -threshold_price: return "SHORTS ADDING"
-    if dOI < -threshold_oi and dP < -threshold_price: return "LONG LIQUIDATION"
-    if dOI < -threshold_oi and dP >  threshold_price: return "SHORT COVERING"
+def classify_oi_phase(oi_history: deque, current_oi: float, current_price: float) -> str:
+    if len(oi_history) < 2:
+        return "NEUTRAL"
+    
+    # Compare with the oldest tick in the window (e.g. 15 minutes ago)
+    oldest_price, oldest_oi = oi_history[0]
+    
+    dOI = current_oi - oldest_oi
+    dP  = current_price - oldest_price
+    
+    if dOI >  OI_THRESHOLD_VAL and dP >  OI_PRICE_THRESHOLD: return "LONGS ADDING"
+    if dOI >  OI_THRESHOLD_VAL and dP < -OI_PRICE_THRESHOLD: return "SHORTS ADDING"
+    if dOI < -OI_THRESHOLD_VAL and dP < -OI_PRICE_THRESHOLD: return "LONG LIQUIDATION"
+    if dOI < -OI_THRESHOLD_VAL and dP >  OI_PRICE_THRESHOLD: return "SHORT COVERING"
     return "NEUTRAL"
 
 def oi_allows_trade(phase: str, is_bull: bool) -> bool:
@@ -582,9 +598,10 @@ def save_orderbook(ob: dict):
         ts = datetime.now(timezone.utc).isoformat()
         db = get_db()
         rows = []
-        for lvl, e in enumerate(ob.get("buy",  [])[:10]):
+        # Save only top 3 levels to optimize DB packet size
+        for lvl, e in enumerate(ob.get("buy",  [])[:3]):
             rows.append((ts, "buy",  float(e["price"]), int(e["size"]), float(e["depth"]), lvl))
-        for lvl, e in enumerate(ob.get("sell", [])[:10]):
+        for lvl, e in enumerate(ob.get("sell", [])[:3]):
             rows.append((ts, "sell", float(e["price"]), int(e["size"]), float(e["depth"]), lvl))
         db.executemany(
             "INSERT INTO order_book (timestamp,side,price,size,depth,level) VALUES (?,?,?,?,?,?)", rows)
@@ -738,7 +755,8 @@ def save_trade(trade: dict) -> int | None:
     return row[0] if row else None
 
 def update_trade(trade_id, status, entry_price=None, exit_price=None,
-                 exit_time=None, pnl_usd=None, pnl_inr=None, reason=None):
+                 exit_time=None, pnl_usd=None, pnl_inr=None, reason=None,
+                 sl_price=None):
     db  = get_db()
     row = db.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
     if not row:
@@ -747,9 +765,10 @@ def update_trade(trade_id, status, entry_price=None, exit_price=None,
         """UPDATE trades SET status=?,entry_price=COALESCE(?,entry_price),
            exit_price=COALESCE(?,exit_price),exit_time=COALESCE(?,exit_time),
            pnl_usd=COALESCE(?,pnl_usd),pnl_inr=COALESCE(?,pnl_inr),
-           exit_reason=COALESCE(?,exit_reason)
+           exit_reason=COALESCE(?,exit_reason),
+           sl_price=COALESCE(?,sl_price)
            WHERE id=?""",
-        (status, entry_price, exit_price, exit_time, pnl_usd, pnl_inr, reason, trade_id),
+        (status, entry_price, exit_price, exit_time, pnl_usd, pnl_inr, reason, sl_price, trade_id),
     )
     db.commit()
 
@@ -789,6 +808,38 @@ def create_pending(fib_level: str, reversal_close: float, phase: dict,
     if signals.get("halted"):
         return None
 
+    side     = "buy" if is_bull else "sell"
+
+    # Session Scheduling Check (UTC Time)
+    now_utc = datetime.now(timezone.utc)
+    wday = now_utc.weekday()
+    hour = now_utc.hour
+
+    # Block Weekends (Saturday=5, Sunday=6)
+    if wday in (5, 6):
+        signals["last_signal"] = f"[SCHED BLOCKED] {side.upper()} @ Fib {fib_level} — Weekend"
+        console.print(f"[yellow]Scheduling filter blocked {side.upper()} at Fib {fib_level}: Weekend[/yellow]")
+        return None
+
+    # Block outside European last hour (15:00 UTC) and US full hours (16:00 - 24:00 UTC)
+    if not (15 <= hour < 24):
+        signals["last_signal"] = f"[SCHED BLOCKED] {side.upper()} @ Fib {fib_level} — Hour {hour:02d} UTC"
+        console.print(f"[yellow]Scheduling filter blocked {side.upper()} at Fib {fib_level}: Hour {hour:02d} UTC[/yellow]")
+        return None
+
+    # Options PCR Sentiment filter
+    opt = fetch_options_metrics()
+    if opt:
+        pcr = opt["pcr_oi"]
+        if not is_bull and pcr < OPTION_PCR_BULLISH_THRESHOLD:
+            signals["last_signal"] = f"[PCR BLOCKED] SELL @ Fib {fib_level} — PCR {pcr:.2f} too Bullish"
+            console.print(f"[yellow]Options PCR filter blocked SELL at Fib {fib_level}: PCR {pcr:.2f} (Bullish)[/yellow]")
+            return None
+        elif is_bull and pcr > OPTION_PCR_BEARISH_THRESHOLD:
+            signals["last_signal"] = f"[PCR BLOCKED] BUY @ Fib {fib_level} — PCR {pcr:.2f} too Bearish"
+            console.print(f"[yellow]Options PCR filter blocked BUY at Fib {fib_level}: PCR {pcr:.2f} (Bearish)[/yellow]")
+            return None
+
     fib_prices = calc_fib_prices(phase["phase_st"], phase["phase_hh"], phase["phase_ll"], is_bull)
 
     SL_TP = {
@@ -799,7 +850,6 @@ def create_pending(fib_level: str, reversal_close: float, phase: dict,
     mapping  = SL_TP[fib_level]
     sl_price = fib_prices[mapping["sl"]]
     tp_price = fib_prices[mapping["tp"]]
-    side     = "buy" if is_bull else "sell"
 
     # OI institutional filter
     if not oi_allows_trade(oi_phase, is_bull):
@@ -863,19 +913,20 @@ def activate_pending(pending: dict, mark_price: float, account: dict, signals: d
 
     entry_price = pp   # paper fill at the pending price (limit order style)
     position = {
-        "side":         side,
-        "entry_price":  entry_price,
-        "sl_price":     pending["sl_price"],
-        "tp_price":     pending["tp_price"],
-        "fib_level":    pending["fib_level"],
-        "lots":         pending["lots"],
-        "size_btc":     pending["size_btc"],
-        "notional_usd": pending["lots"] * entry_price * CONTRACT_VALUE,
-        "risk_usd":     pending["risk_usd"],
-        "oi_at_entry":  pending["oi_at_entry"],
-        "ls_at_entry":  pending["ls_at_entry"],
-        "oi_phase":     pending["oi_phase"],
-        "_id":          pending["_id"],
+        "side":             side,
+        "entry_price":      entry_price,
+        "sl_price":         pending["sl_price"],
+        "sl_price_initial": pending["sl_price"],
+        "tp_price":         pending["tp_price"],
+        "fib_level":        pending["fib_level"],
+        "lots":             pending["lots"],
+        "size_btc":         pending["size_btc"],
+        "notional_usd":     pending["lots"] * entry_price * CONTRACT_VALUE,
+        "risk_usd":         pending["risk_usd"],
+        "oi_at_entry":      pending["oi_at_entry"],
+        "ls_at_entry":      pending["ls_at_entry"],
+        "oi_phase":         pending["oi_phase"],
+        "_id":              pending["_id"],
     }
 
     update_trade(pending["_id"], "open", entry_price=entry_price)
@@ -895,8 +946,56 @@ def manage_position(position: dict, mark_price: float,
         return position, account
 
     side = position["side"]
+    entry = position["entry_price"]
     sl   = position["sl_price"]
     tp   = position["tp_price"]
+
+    # ── Break-Even Stop Loss Check ────────────────────────────
+    if BE_ENABLED and not position.get("is_break_even", False):
+        initial_sl = position.get("sl_price_initial", sl)
+        risk_dist = abs(entry - initial_sl)
+        
+        # Check if profit threshold reached (1.0R)
+        if side == "buy" and mark_price >= entry + (risk_dist * BE_TRIGGER_R_MULTIPLE):
+            position["sl_price"] = entry
+            position["is_break_even"] = True
+            update_trade(position["_id"], "open", sl_price=entry)
+            console.print(f"[green]Break-Even Triggered! SL moved to entry: ${entry:,.2f}[/green]")
+        elif side == "sell" and mark_price <= entry - (risk_dist * BE_TRIGGER_R_MULTIPLE):
+            position["sl_price"] = entry
+            position["is_break_even"] = True
+            update_trade(position["_id"], "open", sl_price=entry)
+            console.print(f"[green]Break-Even Triggered! SL moved to entry: ${entry:,.2f}[/green]")
+
+    sl = position["sl_price"]
+
+    # ── Active Floating Drawdown Check ────────────────────────
+    upnl = ((mark_price - entry) if side == "buy" else (entry - mark_price)) * position["lots"] * CONTRACT_VALUE
+    estimated_capital = account["capital_usd"] + upnl
+    peak = max(account["peak_capital"], estimated_capital)
+    floating_dd = (peak - estimated_capital) / peak * 100
+    
+    if floating_dd >= MAX_DRAWDOWN_PCT * 100:
+        # Drawdown limit hit while trade is open! Force close.
+        exit_reason = "DD_LIMIT"
+        exit_price  = mark_price
+        exit_time   = datetime.now(timezone.utc).isoformat()
+
+        update_trade(position["_id"], "closed",
+                     exit_price=exit_price, exit_time=exit_time,
+                     pnl_usd=round(upnl, 4), pnl_inr=round(upnl / INR_TO_USD, 2),
+                     reason=exit_reason)
+
+        account["capital_usd"]   += upnl
+        account["capital_inr"]    = account["capital_usd"] / INR_TO_USD
+        account["total_pnl_usd"] += upnl
+        account["peak_capital"]   = max(account["peak_capital"], account["capital_usd"])
+        account["losing_trades"]  += 1
+
+        signals["last_signal"] = f"DD EXIT @ {exit_price:,.2f} | PnL ${upnl:,.2f}"
+        console.print(f"[bold red]Floating Drawdown limit breached ({floating_dd:.2f}%)! Force closing position @ {exit_price:,.2f} (PnL ${upnl:,.2f})[/bold red]")
+        signals["halted"] = True
+        return None, account
 
     hit_sl = (side == "buy"  and mark_price <= sl) or (side == "sell" and mark_price >= sl)
     hit_tp = (side == "buy"  and mark_price >= tp) or (side == "sell" and mark_price <= tp)
@@ -1118,6 +1217,36 @@ def render_dashboard(state, ticker, ob, fib_prices, phase_state, position,
 #  MAIN BOT LOOP
 # ═══════════════════════════════════════════════════════════════
 def run_bot():
+    lock_path = "bot.lock"
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path) as f:
+                pid = int(f.read().strip())
+            
+            # Check if process is running on Windows
+            import ctypes
+            PROCESS_QUERY_INFORMATION = 0x0400
+            SYNCHRONIZE = 0x0010
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                console.print(f"[bold red][ERROR] Another instance of the bot is already running (PID: {pid}). Exiting.[/bold red]")
+                return
+            else:
+                # Stale lock file, remove it
+                os.remove(lock_path)
+        except Exception:
+            try:
+                os.remove(lock_path)
+            except:
+                pass
+
+    try:
+        with open(lock_path, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        console.print(f"[red]Warning: Could not create lock file: {e}[/red]")
+
     init_db()
     console.print("[bold green]Alpha v5 — 15-min timeframe | Pending orders | OI flow filter[/bold green]")
 
@@ -1177,6 +1306,7 @@ def run_bot():
     prev_oi      = 0.0
     prev_price   = 0.0
     ob_last_save = 0.0
+    oi_history   = deque(maxlen=OI_WINDOW_LEAP_TICKS)
 
     # ── Historical candles ────────────────────────────────────
     hist = fetch_historical_candles(HIST_LOOKBACK_MINS)
@@ -1188,7 +1318,9 @@ def run_bot():
 
     ticker = ob = None
 
-    with Live(console=console, refresh_per_second=0.2, screen=True) as live:
+    live = Live(console=console, refresh_per_second=0.2, screen=True)
+    live.start()
+    try:
         while True:
             try:
                 ticker = fetch_ticker()
@@ -1225,7 +1357,8 @@ def run_bot():
                     ob_last_save = now_ts
 
                 # ── OI intelligence update ────────────────────
-                curr_phase = classify_oi_phase(prev_oi, curr_oi, prev_price, mark_price)
+                oi_history.append((mark_price, curr_oi))
+                curr_phase = classify_oi_phase(oi_history, curr_oi, mark_price)
                 phase_counts[curr_phase] = phase_counts.get(curr_phase, 0) + 1
 
                 if ob:
@@ -1368,6 +1501,16 @@ def run_bot():
                                         pending = p
                                         break   # only one pending at a time
 
+                # ── Session Scheduling Cleanup ────────────────
+                if pending:
+                    now_utc = datetime.now(timezone.utc)
+                    wday = now_utc.weekday()
+                    hour = now_utc.hour
+                    if wday in (5, 6) or not (15 <= hour < 24):
+                        update_trade(pending["_id"], "cancelled")
+                        pending = None
+                        console.print("[yellow]Pending order cancelled — Session closed[/yellow]")
+
                 # ── Activate pending order ────────────────────
                 if pending and not position:
                     pos = activate_pending(pending, mark_price, account, signals)
@@ -1406,6 +1549,13 @@ def run_bot():
                 log_err("Main loop error", exc)
                 console.print(f"[red]Loop error (logged): {exc}[/red]")
                 time.sleep(LOOP_SLEEP)
+    finally:
+        live.stop()
+        if os.path.exists("bot.lock"):
+            try:
+                os.remove("bot.lock")
+            except:
+                pass
 
 # ═══════════════════════════════════════════════════════════════
 #  ENTRY POINT
